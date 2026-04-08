@@ -1,0 +1,461 @@
+% ============================================================
+%  HPSC 2026 – Assignment 1 White Paper
+%  IEEE two-column conference style (article + geometry)
+% ============================================================
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[a4paper,top=19mm,bottom=43mm,left=15.5mm,right=15.5mm,columnsep=4.5mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\graphicspath{{figures/}}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage[table]{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{siunitx}
+\usepackage{cite}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{times}
+\usepackage{titlesec}
+\usepackage{abstract}
+\usepackage{fancyhdr}
+\usepackage{setspace}
+
+\titleformat{\section}{\normalfont\bfseries}{\Roman{section}.}{0.5em}{\MakeUppercase}
+\titleformat{\subsection}{\normalfont\itshape}{\Alph{subsection}.}{0.5em}{}
+\titlespacing{\section}{0pt}{8pt plus2pt minus1pt}{4pt}
+\titlespacing{\subsection}{0pt}{6pt plus1pt}{2pt}
+
+\renewcommand{\abstractnamefont}{\normalfont\bfseries}
+\renewcommand{\abstracttextfont}{\normalfont\small}
+\setlength{\absleftindent}{0pt}
+\setlength{\absrightindent}{0pt}
+
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+
+\lstset{
+  language=C++,basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{blue!75!black}\bfseries,
+  commentstyle=\color{green!50!black},stringstyle=\color{orange!80!black},
+  numbers=left,numberstyle=\tiny\color{gray},numbersep=4pt,
+  breaklines=true,frame=single,xleftmargin=8pt,framexleftmargin=8pt,
+  aboveskip=4pt,belowskip=4pt
+}
+
+\definecolor{rowgray}{gray}{0.93}
+
+\newcommand{\vv}[1]{\boldsymbol{#1}}
+\newcommand{\norm}[1]{\left\|#1\right\|}
+
+\pagestyle{fancy}\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\fancyfoot[C]{\small\thepage}
+
+\setlength{\columnseprule}{0.4pt}
+\def\columnseprulecolor{\color{gray!40}}
+
+\begin{document}
+
+\twocolumn[{%
+\begin{@twocolumnfalse}
+  \begin{center}
+    {\large\bfseries OpenMP Parallelisation of a Three-Dimensional\\[2pt]
+      Discrete Element Method Particle Solver}\\[8pt]
+    {\normalsize\itshape Tushar}\\[2pt]
+    {\small School of Mechanical and Material Sciences, IIT Mandi \quad \texttt{Tusharkharod366@gmail.com}}\\[10pt]
+  \end{center}
+  \begin{abstract}
+  \noindent
+  We present the implementation, verification, and OpenMP parallelisation
+  of a three-dimensional Discrete Element Method (DEM) solver for spherical
+  particles confined in a cuboidal domain.
+  The solver uses a linear spring-dashpot contact model and semi-implicit
+  Euler time integration.
+  Three verification tests confirm numerical correctness, and a convergence
+  study confirms first-order accuracy (measured slope $\approx1.00$).
+  A cell-linked list neighbour search reduces contact-detection cost from
+  $\mathcal{O}(N^2)$ to $\mathcal{O}(N)$ average complexity.
+  Speedup and parallel efficiency are measured for
+  $N\in\{200,1000,5000\}$ particles on up to $p=8$ threads, achieving a
+  peak speedup of $S\approx6.22$ (efficiency $E\approx77.7\%$) at $N=5000$.
+  Combined, algorithmic and hardware-level optimisations reduce total runtime
+  by approximately two orders of magnitude for large-$N$ systems.
+  \end{abstract}
+  \vspace{10pt}
+\end{@twocolumnfalse}
+}]
+
+%─────────────────────────────────────────────────────────────
+\section{Introduction}\label{sec:intro}
+
+Discrete Element Methods (DEM) model granular materials by explicitly
+tracking every particle and computing pairwise contact forces~\cite{cundall1979}.
+Originally introduced by Cundall and Strack, DEM is now indispensable in
+process engineering, geomechanics, and pharmaceutical
+manufacturing~\cite{dBonn2017granular}.
+The dominant bottleneck is the $\mathcal{O}(N^2)$ contact-detection loop,
+motivating both algorithmic (neighbour search) and hardware-level
+(OpenMP) optimisations.
+
+Section~\ref{sec:model} presents the physical model;
+\ref{sec:algo} the numerical algorithm;
+\ref{sec:verify} verification;
+\ref{sec:profile} profiling;
+\ref{sec:parallel} OpenMP parallelisation;
+\ref{sec:perf} performance analysis.
+
+%─────────────────────────────────────────────────────────────
+\section{Mathematical Formulation}\label{sec:model}
+
+\subsection{Equations of Motion}
+
+Consider $N$ spherical particles with positions $\vv{x}_i$, velocities
+$\vv{v}_i$, masses $m_i$, and radii $R_i$.
+Newton's second law gives
+\begin{align}
+  m_i \frac{d\vv{v}_i}{dt} &= \vv{F}_i ,\label{eq:newton}\\
+  \frac{d\vv{x}_i}{dt}     &= \vv{v}_i ,\label{eq:kin}
+\end{align}
+where
+\begin{equation}
+  \vv{F}_i = m_i\vv{g}
+           + \sum_{j\neq i}\vv{F}^c_{ij}
+           + \vv{F}^w_i .\label{eq:force_total}
+\end{equation}
+
+\subsection{Spring-Dashpot Contact Model}
+
+The normal overlap between particles $i$ and $j$ is
+\begin{equation}
+  \delta_{ij} = R_i+R_j-\norm{\vv{r}_{ij}},\quad
+  \vv{r}_{ij}=\vv{x}_j-\vv{x}_i .\label{eq:overlap}
+\end{equation}
+Contact exists when $\delta_{ij}>0$.  The force is
+\begin{equation}
+  \vv{F}^c_{ij}=F_n\hat{\vv{n}}_{ij},\quad
+  F_n=\max\!\bigl(0,\;k_n\delta_{ij}-\gamma_n v_{n,ij}\bigr),
+  \label{eq:contact}
+\end{equation}
+where $\hat{\vv{n}}_{ij}=\vv{r}_{ij}/\norm{\vv{r}_{ij}}$,
+$v_{n,ij}=(\vv{v}_j-\vv{v}_i)\cdot\hat{\vv{n}}_{ij}$,
+$k_n$ is normal stiffness, and $\gamma_n$ is damping.
+The clamp prevents spurious attractive forces.
+
+\subsection{Wall Contact}
+
+Domain: $[0,L_x]\times[0,L_y]\times[0,L_z]$.
+For the lower $z$ wall, overlap $\delta^w=R_i-z_i$ gives
+$F^w_z=\max(0,k_n\delta^w-\gamma_n(-v_{z,i}))$.
+Analogous expressions apply to all six faces.
+
+%─────────────────────────────────────────────────────────────
+\section{Numerical Algorithm}\label{sec:algo}
+
+\subsection{Time Integration}
+
+Semi-implicit Euler (first-order):
+\begin{align}
+  \vv{v}^{n+1}_i &= \vv{v}^n_i + \frac{\vv{F}^n_i}{m_i}\Delta t,
+  \label{eq:vel_update}\\
+  \vv{x}^{n+1}_i &= \vv{x}^n_i + \vv{v}^{n+1}_i\Delta t.
+  \label{eq:pos_update}
+\end{align}
+Using $\vv{v}^{n+1}$ in the position update improves stability over
+explicit Euler at no additional cost.
+
+\subsection{Timestep Algorithm}
+
+\begin{algorithm}[H]
+\small
+\caption{Single DEM Timestep}\label{alg:timestep}
+\begin{algorithmic}[1]
+  \ForAll{$i$}
+    \State $\vv{F}_i\!\leftarrow\!\vv{0}$;
+           $\;\vv{F}_i\!\mathrel{+}=\!m_i\vv{g}$
+  \EndFor
+  \ForAll{pairs $(i,j)$, $i<j$}
+    \State Compute $\delta_{ij}$ [Eq.~\eqref{eq:overlap}]
+    \If{$\delta_{ij}>0$}
+      \State $\vv{F}_i\mathrel{+}=\vv{F}^c_{ij}$;
+             $\;\vv{F}_j\mathrel{-}=\vv{F}^c_{ij}$
+    \EndIf
+  \EndFor
+  \ForAll{$i$, walls $w$}
+    \State $\vv{F}_i\mathrel{+}=\vv{F}^w$
+  \EndFor
+  \ForAll{$i$}
+    \State Update $\vv{v}_i$, $\vv{x}_i$
+           [Eqs.~\eqref{eq:vel_update}--\eqref{eq:pos_update}]
+  \EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cell-Linked List Neighbour Search}
+
+Brute force evaluates $N(N{-}1)/2$ pairs per step ($\mathcal{O}(N^2)$).
+The cell-linked list~\cite{hockney1988} divides the domain into cells of
+side $\ell_c=2R_{\max}$ and restricts checks to the $3^3=27$ neighbouring
+cells, yielding $\mathcal{O}(N)$ average complexity.
+
+%─────────────────────────────────────────────────────────────
+\section{Verification and Testing}\label{sec:verify}
+
+\subsection{Test 1: Free Fall}
+
+A single particle ($m=\SI{1}{kg}$, $R=\SI{0.05}{m}$) released from rest at
+$z_0=\SI{5}{m}$.
+Analytical: $z(t)=z_0-\tfrac{1}{2}gt^2$.
+Figure~\ref{fig:freefall} shows excellent agreement over $t\in[0,1]\,\si{s}$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{free_fall_trajectory.pdf}
+  \caption{Free-fall: numerical vs.\ analytical $z(t)$ (top)
+           and $v_z(t)$ (bottom). $\Delta t=10^{-4}\,\si{s}$.}
+  \label{fig:freefall}
+\end{figure}
+
+\subsection{Test 2: Constant Velocity}
+
+With $\vv{g}=\vv{0}$ and initial $\vv{v}_0=(1,\,0.5,\,0.3)\,\si{m\,s^{-1}}$,
+the maximum positional error was $<10^{-10}\,\si{m}$, confirming no
+spurious acceleration.
+
+\subsection{Test 3: Bouncing Particle}
+
+A particle dropped from $z=\SI{2}{m}$ (Fig.~\ref{fig:bounce}).
+Maximum wall penetration $<\!1\%$ of $R$.
+Rebound height decreases monotonically confirming energy dissipation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{bounce.pdf}
+  \caption{Bounce test: height $z(t)$ (top), kinetic energy (bottom).
+           $k_n=10^5\,\si{N\,m^{-1}}$,
+           $\gamma_n=\SI{50}{N.s.m^{-1}}$.}
+  \label{fig:bounce}
+\end{figure}
+
+\subsection{Convergence Study}
+
+Figure~\ref{fig:convergence} plots RMSE of $z(t)$ vs $\Delta t$ for seven
+step sizes.  Measured slope $\approx1.00$ confirms first-order accuracy.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{convergence.pdf}
+  \caption{RMSE vs $\Delta t$; measured slope $\approx1.00$.}
+  \label{fig:convergence}
+\end{figure}
+
+%─────────────────────────────────────────────────────────────
+\section{Profiling Results}\label{sec:profile}
+
+Table~\ref{tab:profile} shows the runtime breakdown for $N=1000$ over
+$50\,000$ timesteps (single core, \texttt{-O2 -march=native}).
+Contact detection accounts for $\approx\!95\%$ of total time.
+Enabling \texttt{-O2} gave a $3.8\times$ speedup over the unoptimised
+build before any parallelisation.
+
+\begin{table}[t]
+\centering
+\caption{Serial Runtime Breakdown ($N=1000$, $50\,000$ steps)}\label{tab:profile}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lrr}
+\toprule
+Routine & Time (s) & \% \\
+\midrule
+\rowcolor{rowgray}
+\texttt{compute\_particle\_contacts} & 7.79 & 95.0 \\
+\texttt{compute\_wall\_contacts}     & 0.06 &  0.7 \\
+\rowcolor{rowgray}
+\texttt{semi\_implicit\_euler}       & 0.02 &  0.2 \\
+\texttt{write\_output}               & 0.33 &  4.0 \\
+\midrule
+Total                                & 8.20 & 100  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%─────────────────────────────────────────────────────────────
+\section{Parallel Implementation}\label{sec:parallel}
+
+\subsection{Thread-Local Force Buffers}
+
+The contact loop writes to $\vv{F}_i$ and $\vv{F}_j$ per pair, creating
+a race condition under plain \texttt{\#pragma omp for}.
+Two strategies were evaluated:
+
+\begin{enumerate}\setlength\itemsep{0pt}
+  \item \textit{Atomic updates}---simple but serialises memory traffic.
+  \item \textit{Thread-local buffers}---each thread writes to a private
+        size-$N$ array; arrays are reduced serially after the parallel
+        region.  Lock-free on the hot path; superior for large $N$.
+\end{enumerate}
+
+Strategy~(2) is adopted with \texttt{schedule(dynamic,32)}.
+
+\begin{lstlisting}[caption={OpenMP contact loop (simplified).},label={lst:omp}]
+vector<vector<Vec3>> tf(NTHREADS,
+    vector<Vec3>(N, Vec3(0,0,0)));
+#pragma omp parallel
+{
+  int tid = omp_get_thread_num();
+  #pragma omp for schedule(dynamic,32) nowait
+  for (int i = 0; i < N-1; ++i)
+    for (int j = i+1; j < N; ++j) {
+      // ... compute contact force Fc ...
+      tf[tid][i] += Fc;
+      tf[tid][j] -= Fc;
+    }
+} // barrier
+for (int t=0; t<NTHREADS; ++t)
+  for (int i=0; i<N; ++i)
+    particles[i].force += tf[t][i];
+\end{lstlisting}
+
+Correctness confirmed: max relative KE difference between serial and
+OpenMP runs was $<10^{-12}$.
+
+%─────────────────────────────────────────────────────────────
+\section{Performance Analysis}\label{sec:perf}
+
+\subsection{Scaling Study}
+
+\begin{equation}
+  S(p)=\frac{T_1}{T_p},\qquad E(p)=\frac{S(p)}{p}.
+\end{equation}
+
+Table~\ref{tab:scaling} lists measured $T_p$ and $S(p)$;
+Figure~\ref{fig:scaling} shows the curves.
+
+\begin{table}[t]
+\centering
+\caption{$T_p$ (s) and $S(p)$ for varying $N$ and $p$.}\label{tab:scaling}
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{crrrrrr}
+\toprule
+ & \multicolumn{2}{c}{$N=200$}
+ & \multicolumn{2}{c}{$N=1000$}
+ & \multicolumn{2}{c}{$N=5000$}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+$p$ & $T_p$ & $S$ & $T_p$ & $S$ & $T_p$ & $S$\\
+\midrule
+\rowcolor{rowgray}
+1 & 0.38 & 1.00 & 8.20 & 1.00 & 105.0 & 1.00\\
+2 & 0.25 & 1.54 & 4.59 & 1.79 &  53.6 & 1.96\\
+\rowcolor{rowgray}
+4 & 0.18 & 2.18 & 2.79 & 2.94 &  30.0 & 3.50\\
+8 & 0.14 & 2.74 & 1.99 & 4.12 &  16.9 & 6.22\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{scaling_speedup_efficiency.pdf}
+  \caption{Left: speedup $S(p)$. Right: efficiency $E(p)\,(\%)$.
+           Dotted: ideal scaling.}
+  \label{fig:scaling}
+\end{figure}
+
+At $N=5000$, $p=8$: $S\approx6.22$, $E\approx77.7\%$.
+Sub-linear scaling at $N=200$ ($S_{\max}=2.74$) reflects a large serial
+fraction ($f\approx28\%$, Amdahl limit $1/f\approx3.6$).
+For $N=5000$, $f\approx4\%$ permits much higher speedup.
+
+\subsection{Kinetic Energy Evolution}
+
+Figure~\ref{fig:ke} shows total kinetic energy for settling simulations.
+The initial peak corresponds to free-fall acceleration; the subsequent
+monotonic decay reflects dashpot dissipation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{kinetic_energy.pdf}
+  \caption{Kinetic energy vs time, $N\in\{200,1000,5000\}$.}
+  \label{fig:ke}
+\end{figure}
+
+\subsection{Particle Configuration}
+
+Figure~\ref{fig:snap} shows a snapshot at $t=0.8\,\si{s}$ ($N=500$),
+coloured by speed.  Fast particles cluster near the floor;
+slower particles are settled at greater heights.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.88\linewidth]{snapshot.pdf}
+  \caption{Particle snapshot at $t=0.8\,\si{s}$, $N=500$.
+           Colour = speed (m\,s$^{-1}$).}
+  \label{fig:snap}
+\end{figure}
+
+\subsection{Neighbour Search}
+
+Figure~\ref{fig:nbr} compares per-timestep cost.
+The crossover is at $N\approx850$; above this the neighbour search gives
+$\approx12\times$ speedup at $N=10\,000$.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{neighbor_runtime.pdf}
+  \caption{Runtime: $\mathcal{O}(N^2)$ vs neighbour search.
+           Crossover at $N\approx850$.}
+  \label{fig:nbr}
+\end{figure}
+
+%─────────────────────────────────────────────────────────────
+\section{Discussion and Conclusions}\label{sec:conclusions}
+
+A modular 3-D DEM solver was implemented in C++ and verified against
+analytical solutions for free fall, constant velocity, and wall bounce.
+The semi-implicit Euler integrator shows first-order convergence
+(slope~$\approx1.00$).
+OpenMP parallelisation with thread-local force buffers achieves
+$S\approx6.22$ ($E\approx77.7\%$) at $N=5000$, $p=8$.
+The cell-linked list provides $\approx12\times$ speedup at $N=10\,000$,
+with crossover at $N\approx850$.
+Combined, optimisations reduce total runtime by $\sim\!2$ orders of
+magnitude for large systems.
+
+Future directions include rotational dynamics, non-spherical particles,
+and MPI parallelism for $N>10^6$.
+
+\section*{Acknowledgements}
+LLM assistance (Claude, Anthropic) used for scaffolding; all results
+independently verified.
+Code: \url{https://github.com/TuShhar0007/dem_hpsc2026}
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{9}
+
+\bibitem{cundall1979}
+P.~A.~Cundall and O.~D.~L.~Strack,
+``A discrete numerical model for granular assemblies,''
+\textit{G\'eotechnique}, vol.~29, no.~1, pp.~47--65, 1979.
+
+\bibitem{dBonn2017granular}
+D.~Bonn \textit{et al.},
+``Yield stress materials in soft condensed matter,''
+\textit{Rev.\ Mod.\ Phys.}, vol.~89, p.~035005, 2017.
+
+\bibitem{hockney1988}
+R.~W.~Hockney and J.~W.~Eastwood,
+\textit{Computer Simulation Using Particles}.
+IOP Publishing, 1988.
+
+\bibitem{omp2018}
+OpenMP Architecture Review Board,
+\textit{OpenMP Application Programming Interface, v5.0}, 2018.
+
+\end{thebibliography}
+
+\end{document}
